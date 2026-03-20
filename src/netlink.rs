@@ -20,9 +20,7 @@ use netlink_packet_route::{
     rule::{RuleAction, RuleAttribute, RuleFlags, RuleHeader, RuleMessage},
 };
 use netlink_packet_wireguard::{
-    Wireguard, WireguardCmd,
-    constants::WGPEER_F_REMOVE_ME,
-    nlas::{WgDeviceAttrs, WgPeer, WgPeerAttrs},
+    WireguardAttribute, WireguardCmd, WireguardMessage, WireguardPeer, WireguardPeerAttribute,
 };
 use netlink_sys::{
     Socket, SocketAddr,
@@ -30,13 +28,10 @@ use netlink_sys::{
 };
 use thiserror::Error;
 
-use crate::{
-    IpVersion, Key, WireguardInterfaceError,
-    host::{Host, Peer},
-    net::IpAddrMask,
-};
+use crate::{IpVersion, Key, WireguardInterfaceError, host::Host, net::IpAddrMask, peer::Peer};
 
 const SOCKET_BUFFER_LENGTH: usize = 12288;
+const WGPEER_F_REMOVE_ME: u32 = 1;
 
 #[derive(Debug, Error)]
 pub(crate) enum NetlinkError {
@@ -88,12 +83,12 @@ macro_rules! get_nla_value {
 
 impl Key {
     #[must_use]
-    pub fn as_nlas_remove(&self, ifname: &str) -> Vec<WgDeviceAttrs> {
+    pub fn as_nlas_remove(&self, ifname: &str) -> Vec<WireguardAttribute> {
         vec![
-            WgDeviceAttrs::IfName(ifname.into()),
-            WgDeviceAttrs::Peers(vec![WgPeer(vec![
-                WgPeerAttrs::PublicKey(self.as_array()),
-                WgPeerAttrs::Flags(WGPEER_F_REMOVE_ME),
+            WireguardAttribute::IfName(ifname.into()),
+            WireguardAttribute::Peers(vec![WireguardPeer(vec![
+                WireguardPeerAttribute::PublicKey(self.as_array()),
+                WireguardPeerAttribute::Flags(WGPEER_F_REMOVE_ME),
             ])]),
         ]
     }
@@ -372,9 +367,9 @@ pub(crate) fn delete_interface(ifname: &str) -> NetlinkResult<()> {
 /// Read host interface data
 pub(crate) fn get_host(ifname: &str) -> NetlinkResult<Host> {
     debug!("Reading Netlink data for interface {ifname}");
-    let genlmsg = GenlMessage::from_payload(Wireguard {
+    let genlmsg = GenlMessage::from_payload(WireguardMessage {
         cmd: WireguardCmd::GetDevice,
-        nlas: vec![WgDeviceAttrs::IfName(ifname.into())],
+        attributes: vec![WireguardAttribute::IfName(ifname.into())],
     });
     let responses = netlink_request_genl(genlmsg, NLM_F_REQUEST | NLM_F_DUMP)?;
 
@@ -385,7 +380,7 @@ pub(crate) fn get_host(ifname: &str) -> NetlinkResult<Host> {
             ..
         } = nlmsg
         {
-            host.append_nlas(&message.payload.nlas);
+            host.append_nlas(&message.payload.attributes);
         } else {
             return Err(NetlinkError::UnexpectedPayload);
         }
@@ -396,9 +391,9 @@ pub(crate) fn get_host(ifname: &str) -> NetlinkResult<Host> {
 
 /// Perform interface configuration
 pub(crate) fn set_host(ifname: &str, host: &Host) -> NetlinkResult<()> {
-    let genlmsg = GenlMessage::from_payload(Wireguard {
+    let genlmsg = GenlMessage::from_payload(WireguardMessage {
         cmd: WireguardCmd::SetDevice,
-        nlas: host.as_nlas(ifname),
+        attributes: host.as_nlas(ifname),
     });
     netlink_request_genl(genlmsg, NLM_F_REQUEST | NLM_F_ACK)?;
     // Add peers one by one to avoid packet buffer overflow.
@@ -411,9 +406,9 @@ pub(crate) fn set_host(ifname: &str, host: &Host) -> NetlinkResult<()> {
 
 /// Save or update WireGuard peer configuration
 pub(crate) fn set_peer(ifname: &str, peer: &Peer) -> NetlinkResult<()> {
-    let genlmsg = GenlMessage::from_payload(Wireguard {
+    let genlmsg = GenlMessage::from_payload(WireguardMessage {
         cmd: WireguardCmd::SetDevice,
-        nlas: peer.as_nlas(ifname),
+        attributes: peer.as_nlas(ifname),
     });
     netlink_request_genl(genlmsg, NLM_F_REQUEST | NLM_F_ACK)?;
     Ok(())
@@ -421,9 +416,9 @@ pub(crate) fn set_peer(ifname: &str, peer: &Peer) -> NetlinkResult<()> {
 
 /// Delete a WireGuard peer from interface
 pub(crate) fn delete_peer(ifname: &str, public_key: &Key) -> NetlinkResult<()> {
-    let genlmsg = GenlMessage::from_payload(Wireguard {
+    let genlmsg = GenlMessage::from_payload(WireguardMessage {
         cmd: WireguardCmd::SetDevice,
-        nlas: public_key.as_nlas_remove(ifname),
+        attributes: public_key.as_nlas_remove(ifname),
     });
     netlink_request_genl(genlmsg, NLM_F_REQUEST | NLM_F_ACK)?;
     Ok(())
@@ -520,15 +515,15 @@ pub(crate) fn add_route(
     table: Option<u32>,
 ) -> NetlinkResult<()> {
     let mut message = RouteMessage::default();
-    let mut header = RouteHeader {
+    let header = RouteHeader {
+        address_family: address.address_family(),
+        destination_prefix_length: address.cidr,
         table: RouteHeader::RT_TABLE_MAIN,
         scope: RouteScope::Link,
         kind: RouteType::Unicast,
         protocol: RouteProtocol::Boot,
         ..Default::default()
     };
-    header.address_family = address.address_family();
-    header.destination_prefix_length = address.cidr;
     let route_address = match address.address {
         IpAddr::V4(ipv4) => RouteAddress::Inet(ipv4),
         IpAddr::V6(ipv6) => RouteAddress::Inet6(ipv6),
@@ -560,6 +555,51 @@ pub(crate) fn add_route(
         error!("Failed to add WireGuard interface route interface {ifname} index not found");
         Err(NetlinkError::AddRouteError)
     }
+}
+
+/// Count routes for a given table.
+pub(crate) fn count_routes(ip_version: IpVersion, table: u32) -> NetlinkResult<usize> {
+    let mut message = RouteMessage::default();
+    let header = RouteHeader {
+        address_family: ip_version.address_family(),
+        table: RouteHeader::RT_TABLE_UNSPEC,
+        ..Default::default()
+    };
+    message.header = header;
+    // Push 32-bit table ID.
+    // XXX: doesn't filter
+    message.attributes.push(RouteAttribute::Table(table));
+
+    let responses = netlink_request(
+        RouteNetlinkMessage::GetRoute(message),
+        NLM_F_REQUEST | NLM_F_DUMP,
+        NETLINK_ROUTE,
+    )?;
+
+    let mut count = 0;
+
+    for nlmsg in responses {
+        if let NetlinkMessage {
+            payload: NetlinkPayload::InnerMessage(message),
+            ..
+        } = nlmsg
+        {
+            // Because messages can't be properly filtered, find the first matching `table`.
+            if let RouteNetlinkMessage::NewRoute(RouteMessage { attributes, .. }) = message {
+                for nla in attributes {
+                    if let RouteAttribute::Table(table_id) = nla
+                        && table_id == table
+                    {
+                        count += 1;
+                    }
+                }
+            }
+        } else {
+            debug!("unknown nlmsg response");
+        }
+    }
+
+    Ok(count)
 }
 
 /// Add rule for fwmark.
@@ -757,7 +797,7 @@ mod tests {
                     }
                 }
             } else {
-                debug!("unknown nlmsg response")
+                debug!("unknown nlmsg response");
             }
         }
 
@@ -788,7 +828,7 @@ mod tests {
                     }
                 }
             } else {
-                debug!("unknown nlmsg response")
+                debug!("unknown nlmsg response");
             }
         }
 
@@ -861,5 +901,16 @@ mod tests {
     fn docker_gateway() {
         let gateway = get_gateway(AddressFamily::Inet).unwrap();
         assert!(gateway.is_some());
+    }
+
+    // For this test, execute:
+    // - `ip link add dev wg0 type wireguard`
+    // - `ip link set up dev wg0`
+    // - `ip route add default dev wg0 scope link table 51820`
+    #[ignore]
+    #[test]
+    fn docker_route() {
+        let count = count_routes(IpVersion::IPv4, 51820).unwrap();
+        assert_eq!(count, 1);
     }
 }
